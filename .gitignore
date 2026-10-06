@@ -1,0 +1,9 @@
+# Real config files hold mail passwords - only commit the *.example templates.
+.env
+*.env
+env.bild
+
+__pycache__/
+venv/
+.venv/
+*.orig

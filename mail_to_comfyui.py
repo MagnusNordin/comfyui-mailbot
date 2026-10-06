@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+mail_to_comfyui.py
+
+Watches an IMAP mailbox via IDLE. When a new email arrives from an allowed
+sender, it parses a prompt (and optional negative prompt) from the body,
+submits it to a running ComfyUI instance using a pre-exported API workflow,
+waits for the render to finish, and replies to the original email with the
+generated image attached.
+
+Requires:
+    pip install imapclient python-dotenv requests
+
+Config is read from a .env file in the same directory (see .env.example).
+"""
+
+import json
+import os
+import re
+import smtplib
+import ssl
+import sys
+import time
+import traceback
+import uuid
+from email.message import EmailMessage
+from email.utils import make_msgid
+
+import requests
+from dotenv import load_dotenv
+from imapclient import IMAPClient
+
+load_dotenv()
+
+# ---- Config -----------------------------------------------------------
+
+IMAP_HOST = os.environ["IMAP_HOST"]
+IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
+SMTP_HOST = os.environ["SMTP_HOST"]
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+EMAIL_USER = os.environ["EMAIL_USER"]
+EMAIL_PASS = os.environ["EMAIL_PASS"]
+
+# Comma-separated list of sender addresses allowed to trigger a render.
+# Leave empty to allow anyone (NOT recommended for a public mailbox).
+ALLOWED_SENDERS = {
+    s.strip().lower()
+    for s in os.environ.get("ALLOWED_SENDERS", "").split(",")
+    if s.strip()
+}
+
+COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
+WORKFLOW_PATH = os.environ["WORKFLOW_PATH"]  # path to exported API-format JSON
+POSITIVE_NODE_ID = os.environ["POSITIVE_NODE_ID"]
+NEGATIVE_NODE_ID = os.environ.get("NEGATIVE_NODE_ID")  # optional
+SAVE_IMAGE_NODE_ID = os.environ["SAVE_IMAGE_NODE_ID"]
+
+RENDER_TIMEOUT_SECONDS = int(os.environ.get("RENDER_TIMEOUT_SECONDS", "300"))
+IDLE_TIMEOUT_SECONDS = 29 * 60  # RFC 2177 recommends re-issuing IDLE before 30 min
+
+DEFAULT_NEGATIVE = os.environ.get(
+    "DEFAULT_NEGATIVE_PROMPT",
+    "blurry, distorted, extra limbs, bad anatomy, low quality",
+)
+
+PROCESSED_FOLDER = os.environ.get("PROCESSED_FOLDER", "Processed")
+
+
+# ---- Prompt parsing -----------------------------------------------------
+
+PROMPT_RE = re.compile(r"^\s*Prompt\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+NEGATIVE_RE = re.compile(r"^\s*Negative\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
+QUOTE_HEADER_RE = re.compile(r"^\s*On .+ wrote:\s*$", re.MULTILINE)
+SIGNATURE_SEP_RE = re.compile(r"^\s*--\s*$", re.MULTILINE)
+
+
+def clean_body(body_text):
+    """
+    Strip common quoted-reply chains and signature blocks before treating
+    the body as a fallback prompt, so replying to a thread or having an
+    email signature doesn't pollute the prompt text.
+    """
+    for pattern in (QUOTE_HEADER_RE, SIGNATURE_SEP_RE):
+        match = pattern.search(body_text)
+        if match:
+            body_text = body_text[: match.start()]
+
+    # Drop lines that are quoted text (start with '>')
+    lines = [ln for ln in body_text.splitlines() if not ln.lstrip().startswith(">")]
+    return "\n".join(lines).strip()
+
+
+def extract_prompts(body_text):
+    """Pull 'Prompt: ...' and 'Negative: ...' lines out of the email body.
+
+    If there's no explicit 'Prompt:' line, fall back to treating the
+    cleaned-up body (quoted replies and signature stripped) as the prompt.
+    """
+    pos_match = PROMPT_RE.search(body_text)
+    neg_match = NEGATIVE_RE.search(body_text)
+
+    if pos_match:
+        positive = pos_match.group(1).strip()
+    else:
+        positive = clean_body(body_text) or None
+
+    negative = neg_match.group(1).strip() if neg_match else DEFAULT_NEGATIVE
+    return positive, negative
+
+
+def get_plain_text_body(msg):
+    """Extract the plain-text part of a parsed email.message.Message."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                charset = part.get_content_charset() or "utf-8"
+                return part.get_payload(decode=True).decode(charset, errors="replace")
+        return ""
+    else:
+        charset = msg.get_content_charset() or "utf-8"
+        return msg.get_payload(decode=True).decode(charset, errors="replace")
+
+
+# ---- ComfyUI interaction ------------------------------------------------
+
+def load_workflow_template():
+    with open(WORKFLOW_PATH, "r") as f:
+        return json.load(f)
+
+
+def submit_render(positive_prompt, negative_prompt):
+    workflow = load_workflow_template()
+
+    workflow[POSITIVE_NODE_ID]["inputs"]["text"] = positive_prompt
+    if NEGATIVE_NODE_ID:
+        workflow[NEGATIVE_NODE_ID]["inputs"]["text"] = negative_prompt
+
+    client_id = str(uuid.uuid4())
+    resp = requests.post(
+        f"{COMFYUI_URL}/prompt",
+        json={"prompt": workflow, "client_id": client_id},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["prompt_id"]
+
+
+def wait_for_render(prompt_id, timeout=RENDER_TIMEOUT_SECONDS):
+    """Poll ComfyUI's history endpoint until the render completes."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=30)
+        resp.raise_for_status()
+        history = resp.json()
+        if prompt_id in history:
+            outputs = history[prompt_id].get("outputs", {})
+            node_output = outputs.get(SAVE_IMAGE_NODE_ID)
+            if node_output and "images" in node_output:
+                return node_output["images"][0]  # {filename, subfolder, type}
+        time.sleep(2)
+    raise TimeoutError(f"Render {prompt_id} did not finish within {timeout}s")
+
+
+def fetch_image_bytes(image_info):
+    resp = requests.get(
+        f"{COMFYUI_URL}/view",
+        params={
+            "filename": image_info["filename"],
+            "subfolder": image_info.get("subfolder", ""),
+            "type": image_info.get("type", "output"),
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.content, image_info["filename"]
+
+
+# ---- Email sending --------------------------------------------------------
+
+def send_reply(to_addr, subject, in_reply_to, references, body_text, image_bytes, image_filename, error=None):
+    msg = EmailMessage()
+    msg["From"] = EMAIL_USER
+    msg["To"] = to_addr
+    msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    msg["Message-ID"] = make_msgid()
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+
+    msg.set_content(body_text)
+
+    if image_bytes:
+        msg.add_attachment(
+            image_bytes,
+            maintype="image",
+            subtype="png",
+            filename=image_filename,
+        )
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
+
+
+# ---- Main processing loop --------------------------------------------------
+
+def process_message(client, uid, raw_message):
+    import email
+
+    msg = email.message_from_bytes(raw_message)
+    from_addr = email.utils.parseaddr(msg.get("From", ""))[1].lower()
+    subject = msg.get("Subject", "(no subject)")
+    message_id = msg.get("Message-ID", "")
+    references = msg.get("References", "") or message_id
+
+    print(f"[{time.strftime('%H:%M:%S')}] New mail from {from_addr}: {subject!r}")
+
+    if ALLOWED_SENDERS and from_addr not in ALLOWED_SENDERS:
+        print(f"  -> sender not in ALLOWED_SENDERS, ignoring")
+        return
+
+    body = get_plain_text_body(msg)
+    positive, negative = extract_prompts(body)
+
+    if not positive:
+        print("  -> email body was empty, sending an error reply")
+        send_reply(
+            from_addr, subject, message_id, references,
+            "Your email body was empty, so there was nothing to use as a prompt. "
+            "Just write your prompt as the message body, or use:\n\nPrompt: a photo of a red fox in snow\nNegative: blurry, low quality",
+            None, None,
+        )
+        return
+
+    try:
+        print(f"  -> submitting render: {positive!r}")
+        prompt_id = submit_render(positive, negative)
+        image_info = wait_for_render(prompt_id)
+        image_bytes, filename = fetch_image_bytes(image_info)
+        print(f"  -> render complete: {filename}")
+        send_reply(
+            from_addr, subject, message_id, references,
+            f"Here's your image for:\n\n{positive}",
+            image_bytes, filename,
+        )
+    except Exception as e:
+        print(f"  -> render failed: {e}")
+        traceback.print_exc()
+        send_reply(
+            from_addr, subject, message_id, references,
+            f"Sorry, the render failed: {e}",
+            None, None,
+        )
+
+
+def resolve_folder_path(client, name):
+    """
+    Some IMAP servers (one.com, other Dovecot-based hosts included) require
+    custom folders to live under a personal namespace prefix, e.g. "INBOX."
+    rather than at the top level. Detect that prefix via NAMESPACE and apply
+    it, so the same code works whether or not a prefix is required.
+    """
+    if "." in name or "/" in name:
+        return name  # already looks like a full path
+
+    try:
+        ns = client.namespace()
+        personal = ns.personal
+    except Exception:
+        personal = None
+
+    if personal:
+        prefix, _sep = personal[0]
+        if prefix and not name.startswith(prefix):
+            return f"{prefix}{name}"
+    return name
+
+
+def ensure_processed_folder(client):
+    global PROCESSED_FOLDER
+    PROCESSED_FOLDER = resolve_folder_path(client, PROCESSED_FOLDER)
+    folders = [f[2] for f in client.list_folders()]
+    if PROCESSED_FOLDER not in folders:
+        client.create_folder(PROCESSED_FOLDER)
+
+
+def handle_new_messages(client):
+    client.select_folder("INBOX")
+    uids = client.search(["UNSEEN"])
+    for uid in uids:
+        raw = client.fetch([uid], ["RFC822"])[uid][b"RFC822"]
+        try:
+            process_message(client, uid, raw)
+        except Exception:
+            print("Unhandled error processing message:")
+            traceback.print_exc()
+        finally:
+            # Mark seen and move aside so we never reprocess it.
+            client.add_flags([uid], [b"\\Seen"])
+            try:
+                client.move([uid], PROCESSED_FOLDER)
+            except Exception:
+                pass  # some servers use copy+delete; not fatal if move fails
+
+
+def main_loop():
+    while True:
+        try:
+            with IMAPClient(IMAP_HOST, port=IMAP_PORT, ssl=True) as client:
+                client.login(EMAIL_USER, EMAIL_PASS)
+                ensure_processed_folder(client)
+                client.select_folder("INBOX")
+
+                # Handle anything that arrived while we were offline.
+                handle_new_messages(client)
+
+                print(f"[{time.strftime('%H:%M:%S')}] Entering IDLE, watching {IMAP_HOST}...")
+                while True:
+                    client.idle()
+                    responses = client.idle_check(timeout=IDLE_TIMEOUT_SECONDS)
+                    client.idle_done()
+                    if responses:
+                        handle_new_messages(client)
+        except Exception as e:
+            print(f"Connection error: {e}. Reconnecting in 15s...")
+            traceback.print_exc()
+            time.sleep(15)
+
+
+if __name__ == "__main__":
+    main_loop()
