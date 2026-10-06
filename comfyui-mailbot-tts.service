@@ -1,0 +1,16 @@
+[Unit]
+Description=ComfyUI Mail Bot (TTS)
+After=network.target comfyui.service
+Wants=comfyui.service
+
+[Service]
+Type=simple
+User=magnor
+WorkingDirectory=/home/magnor/comfyui-mailbot
+Environment=ENV_FILE=tts.env
+ExecStart=/home/magnor/comfyui-mailbot/venv/bin/python mail_to_comfyui.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

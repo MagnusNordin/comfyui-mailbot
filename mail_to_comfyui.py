@@ -6,15 +6,18 @@ Watches an IMAP mailbox via IDLE. When a new email arrives from an allowed
 sender, it parses a prompt (and optional negative prompt) from the body,
 submits it to a running ComfyUI instance using a pre-exported API workflow,
 waits for the render to finish, and replies to the original email with the
-generated image attached.
+generated image (or audio, for TTS workflows) attached.
 
 Requires:
     pip install imapclient python-dotenv requests
 
 Config is read from a .env file in the same directory (see .env.example).
+Set ENV_FILE to use a different file, so several mailboxes can each run
+their own instance with their own workflow (e.g. ENV_FILE=tts.env).
 """
 
 import json
+import mimetypes
 import os
 import re
 import smtplib
@@ -30,7 +33,9 @@ import requests
 from dotenv import load_dotenv
 from imapclient import IMAPClient
 
-load_dotenv()
+# Load only the named file: falling back to the default .env would leak the
+# image bot's settings into any other instance for keys it doesn't set.
+load_dotenv(os.environ.get("ENV_FILE", ".env"))
 
 # ---- Config -----------------------------------------------------------
 
@@ -53,7 +58,18 @@ COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
 WORKFLOW_PATH = os.environ["WORKFLOW_PATH"]  # path to exported API-format JSON
 POSITIVE_NODE_ID = os.environ["POSITIVE_NODE_ID"]
 NEGATIVE_NODE_ID = os.environ.get("NEGATIVE_NODE_ID")  # optional
-SAVE_IMAGE_NODE_ID = os.environ["SAVE_IMAGE_NODE_ID"]
+SAVE_IMAGE_NODE_ID = os.environ["SAVE_IMAGE_NODE_ID"]  # the Save Image / Save Audio node
+
+# "image" for image workflows, "audio" for TTS workflows.
+OUTPUT_KIND = os.environ.get("OUTPUT_KIND", "image").strip().lower()
+if OUTPUT_KIND not in ("image", "audio"):
+    sys.exit(f"OUTPUT_KIND must be 'image' or 'audio', got {OUTPUT_KIND!r}")
+# Key under which ComfyUI reports the save node's files in /history.
+OUTPUT_HISTORY_KEY = {"image": "images", "audio": "audio"}[OUTPUT_KIND]
+
+# Name of the text input on the POSITIVE_NODE_ID node. CLIPTextEncode uses
+# "text"; some TTS nodes call it something else (check the exported JSON).
+PROMPT_INPUT_NAME = os.environ.get("PROMPT_INPUT_NAME", "text")
 
 RENDER_TIMEOUT_SECONDS = int(os.environ.get("RENDER_TIMEOUT_SECONDS", "300"))
 IDLE_TIMEOUT_SECONDS = 29 * 60  # RFC 2177 recommends re-issuing IDLE before 30 min
@@ -72,7 +88,8 @@ PROMPT_RE = re.compile(r"^\s*Prompt\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 NEGATIVE_RE = re.compile(r"^\s*Negative\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 
 
-QUOTE_HEADER_RE = re.compile(r"^\s*On .+ wrote:\s*$", re.MULTILINE)
+# English and Swedish mail clients ("On ... wrote:" / "Den ... skrev:").
+QUOTE_HEADER_RE = re.compile(r"^\s*(On .+ wrote|Den .+ skrev .+):\s*$", re.MULTILINE)
 SIGNATURE_SEP_RE = re.compile(r"^\s*--\s*$", re.MULTILINE)
 
 
@@ -97,7 +114,13 @@ def extract_prompts(body_text):
 
     If there's no explicit 'Prompt:' line, fall back to treating the
     cleaned-up body (quoted replies and signature stripped) as the prompt.
+
+    For audio (TTS) the whole cleaned body is the text to speak, since it
+    is usually several lines/paragraphs, and there is no negative prompt.
     """
+    if OUTPUT_KIND == "audio":
+        return clean_body(body_text) or None, None
+
     pos_match = PROMPT_RE.search(body_text)
     neg_match = NEGATIVE_RE.search(body_text)
 
@@ -133,8 +156,8 @@ def load_workflow_template():
 def submit_render(positive_prompt, negative_prompt):
     workflow = load_workflow_template()
 
-    workflow[POSITIVE_NODE_ID]["inputs"]["text"] = positive_prompt
-    if NEGATIVE_NODE_ID:
+    workflow[POSITIVE_NODE_ID]["inputs"][PROMPT_INPUT_NAME] = positive_prompt
+    if NEGATIVE_NODE_ID and negative_prompt is not None:
         workflow[NEGATIVE_NODE_ID]["inputs"]["text"] = negative_prompt
 
     client_id = str(uuid.uuid4())
@@ -157,8 +180,11 @@ def wait_for_render(prompt_id, timeout=RENDER_TIMEOUT_SECONDS):
         if prompt_id in history:
             outputs = history[prompt_id].get("outputs", {})
             node_output = outputs.get(SAVE_IMAGE_NODE_ID)
-            if node_output and "images" in node_output:
-                return node_output["images"][0]  # {filename, subfolder, type}
+            if node_output and node_output.get(OUTPUT_HISTORY_KEY):
+                return node_output[OUTPUT_HISTORY_KEY][0]  # {filename, subfolder, type}
+            status = history[prompt_id].get("status", {})
+            if status.get("status_str") == "error":
+                raise RuntimeError(f"ComfyUI reported an error for {prompt_id}: {status.get('messages')}")
         time.sleep(2)
     raise TimeoutError(f"Render {prompt_id} did not finish within {timeout}s")
 
@@ -193,10 +219,15 @@ def send_reply(to_addr, subject, in_reply_to, references, body_text, image_bytes
     msg.set_content(body_text)
 
     if image_bytes:
+        # SaveImage gives .png; SaveAudio/SaveAudioMP3 give .flac/.mp3 etc.
+        mime = mimetypes.guess_type(image_filename)[0]
+        if not mime:
+            mime = "image/png" if OUTPUT_KIND == "image" else "application/octet-stream"
+        maintype, subtype = mime.split("/", 1)
         msg.add_attachment(
             image_bytes,
-            maintype="image",
-            subtype="png",
+            maintype=maintype,
+            subtype=subtype,
             filename=image_filename,
         )
 
@@ -228,12 +259,13 @@ def process_message(client, uid, raw_message):
 
     if not positive:
         print("  -> email body was empty, sending an error reply")
-        send_reply(
-            from_addr, subject, message_id, references,
-            "Your email body was empty, so there was nothing to use as a prompt. "
-            "Just write your prompt as the message body, or use:\n\nPrompt: a photo of a red fox in snow\nNegative: blurry, low quality",
-            None, None,
-        )
+        if OUTPUT_KIND == "audio":
+            hint = ("Your email body was empty, so there was nothing to read aloud. "
+                    "Write the text you want spoken as the message body.")
+        else:
+            hint = ("Your email body was empty, so there was nothing to use as a prompt. "
+                    "Just write your prompt as the message body, or use:\n\nPrompt: a photo of a red fox in snow\nNegative: blurry, low quality")
+        send_reply(from_addr, subject, message_id, references, hint, None, None)
         return
 
     try:
@@ -244,7 +276,7 @@ def process_message(client, uid, raw_message):
         print(f"  -> render complete: {filename}")
         send_reply(
             from_addr, subject, message_id, references,
-            f"Here's your image for:\n\n{positive}",
+            f"Here's your {'audio' if OUTPUT_KIND == 'audio' else 'image'} for:\n\n{positive}",
             image_bytes, filename,
         )
     except Exception as e:
@@ -318,7 +350,7 @@ def main_loop():
                 # Handle anything that arrived while we were offline.
                 handle_new_messages(client)
 
-                print(f"[{time.strftime('%H:%M:%S')}] Entering IDLE, watching {IMAP_HOST}...")
+                print(f"[{time.strftime('%H:%M:%S')}] Entering IDLE, watching {EMAIL_USER} on {IMAP_HOST} ({OUTPUT_KIND})...")
                 while True:
                     client.idle()
                     responses = client.idle_check(timeout=IDLE_TIMEOUT_SECONDS)
