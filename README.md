@@ -90,3 +90,7 @@ Logs: `journalctl -u comfyui-mailbot -f` (or `comfyui-mailbot-tts`).
 Never commit a filled-in `.env` / `tts.env`; they are gitignored. Always set
 `ALLOWED_SENDERS`: the check is against the `From` header, which can be
 forged, so also keep the bot's address private.
+
+## License
+
+[MIT](LICENSE)
