@@ -27,7 +27,7 @@ import time
 import traceback
 import uuid
 from email.message import EmailMessage
-from email.utils import make_msgid
+from email.utils import formatdate, make_msgid
 
 import requests
 from dotenv import load_dotenv
@@ -214,7 +214,10 @@ def send_reply(to_addr, subject, in_reply_to, references, body_text, image_bytes
     msg["From"] = EMAIL_USER
     msg["To"] = to_addr
     msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
-    msg["Message-ID"] = make_msgid()
+    # Spam filters penalise a missing Date and a Message-ID on the machine's
+    # bare hostname (e.g. "@magnor"), so set both explicitly.
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=EMAIL_USER.rsplit("@", 1)[-1])
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
     if references:
