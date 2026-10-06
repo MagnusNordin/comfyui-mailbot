@@ -25,7 +25,9 @@ import ssl
 import sys
 import time
 import traceback
+import unicodedata
 import uuid
+from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 
@@ -74,6 +76,11 @@ OUTPUT_HISTORY_KEY = {"image": "images", "audio": "audio"}[OUTPUT_KIND]
 # Name of the text input on the POSITIVE_NODE_ID node. CLIPTextEncode uses
 # "text"; some TTS nodes call it something else (check the exported JSON).
 PROMPT_INPUT_NAME = os.environ.get("PROMPT_INPUT_NAME", "text")
+
+# Optional: a Load Audio node whose file is picked by the email subject, so
+# the subject selects the TTS voice (e.g. "anna" -> anna.wav in ComfyUI/input).
+VOICE_NODE_ID = os.environ.get("VOICE_NODE_ID")
+VOICE_INPUT_NAME = os.environ.get("VOICE_INPUT_NAME", "audio")
 
 RENDER_TIMEOUT_SECONDS = int(os.environ.get("RENDER_TIMEOUT_SECONDS", "300"))
 IDLE_TIMEOUT_SECONDS = 29 * 60  # RFC 2177 recommends re-issuing IDLE before 30 min
@@ -157,12 +164,54 @@ def load_workflow_template():
         return json.load(f)
 
 
-def submit_render(positive_prompt, negative_prompt):
+REPLY_PREFIX_RE = re.compile(r"^\s*((re|sv|fw|fwd|vb)\s*:\s*)+", re.IGNORECASE)
+
+
+def available_voices():
+    """
+    Ask ComfyUI which files the voice node can load, keyed by lowercase
+    name without extension. Asked per email, so a sample dropped into
+    ComfyUI/input is usable right away without a restart.
+    """
+    class_type = load_workflow_template()[VOICE_NODE_ID]["class_type"]
+    resp = requests.get(f"{COMFYUI_URL}/object_info/{class_type}", timeout=30)
+    resp.raise_for_status()
+    spec = resp.json()[class_type]["input"]["required"][VOICE_INPUT_NAME]
+    # Newer ComfyUI: ["COMBO", {"options": [...]}]; older: [[...], {...}]
+    files = spec[1].get("options", []) if spec[0] == "COMBO" else spec[0]
+    return {voice_key(os.path.splitext(os.path.basename(f))[0]): f for f in files}
+
+
+def voice_key(name):
+    # NFC so "Å" typed in a subject matches a file name saved decomposed (e.g. from a Mac).
+    return unicodedata.normalize("NFC", name).strip().lower()
+
+
+def pick_voice(subject):
+    """Map the email subject to a voice file. Returns (file or None, note for the reply)."""
+    wanted = REPLY_PREFIX_RE.sub("", subject).strip()
+    voices = available_voices()
+    default = load_workflow_template()[VOICE_NODE_ID]["inputs"][VOICE_INPUT_NAME]
+    default_name = os.path.splitext(os.path.basename(default))[0]
+    names = ", ".join(sorted(voices)) or "(none)"
+
+    if voice_key(wanted) in voices:
+        return voices[voice_key(wanted)], f"Voice: {voice_key(wanted)}"
+    if not wanted:
+        return None, (f"Voice: {default_name} (default). Put a voice name in the "
+                      f"subject to pick another. Available: {names}")
+    return None, (f"There's no voice called {wanted!r}, so the default "
+                  f"({default_name}) was used. Available: {names}")
+
+
+def submit_render(positive_prompt, negative_prompt, voice=None):
     workflow = load_workflow_template()
 
     workflow[POSITIVE_NODE_ID]["inputs"][PROMPT_INPUT_NAME] = positive_prompt
     if NEGATIVE_NODE_ID and negative_prompt is not None:
         workflow[NEGATIVE_NODE_ID]["inputs"]["text"] = negative_prompt
+    if voice:
+        workflow[VOICE_NODE_ID]["inputs"][VOICE_INPUT_NAME] = voice
 
     client_id = str(uuid.uuid4())
     resp = requests.post(
@@ -251,7 +300,8 @@ def process_message(client, uid, raw_message):
 
     msg = email.message_from_bytes(raw_message)
     from_addr = email.utils.parseaddr(msg.get("From", ""))[1].lower()
-    subject = msg.get("Subject", "(no subject)")
+    # Decode RFC 2047 words (=?UTF-8?Q?...?=) so non-ASCII subjects read and match properly.
+    subject = str(make_header(decode_header(msg.get("Subject", ""))))
     message_id = msg.get("Message-ID", "")
     references = msg.get("References", "") or message_id
 
@@ -276,14 +326,20 @@ def process_message(client, uid, raw_message):
         return
 
     try:
+        voice, voice_note = pick_voice(subject) if VOICE_NODE_ID else (None, "")
+        if voice_note:
+            print(f"  -> {voice_note}")
         print(f"  -> submitting render: {positive!r}")
-        prompt_id = submit_render(positive, negative)
+        prompt_id = submit_render(positive, negative, voice)
         image_info = wait_for_render(prompt_id)
         image_bytes, filename = fetch_image_bytes(image_info)
         print(f"  -> render complete: {filename}")
+        reply = f"Here's your {'audio' if OUTPUT_KIND == 'audio' else 'image'} for:\n\n{positive}"
+        if voice_note:
+            reply += f"\n\n{voice_note}"
         send_reply(
             from_addr, subject, message_id, references,
-            f"Here's your {'audio' if OUTPUT_KIND == 'audio' else 'image'} for:\n\n{positive}",
+            reply,
             image_bytes, filename,
         )
     except Exception as e:
