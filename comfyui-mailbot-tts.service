@@ -7,6 +7,8 @@ Wants=comfyui.service
 Type=simple
 User=magnor
 WorkingDirectory=/home/magnor/comfyui-mailbot
+# Without this, print() output sits in a buffer and never reaches the journal.
+Environment=PYTHONUNBUFFERED=1
 Environment=ENV_FILE=tts.env
 ExecStart=/home/magnor/comfyui-mailbot/venv/bin/python mail_to_comfyui.py
 Restart=always
