@@ -37,6 +37,10 @@ from imapclient import IMAPClient
 # image bot's settings into any other instance for keys it doesn't set.
 load_dotenv(os.environ.get("ENV_FILE", ".env"))
 
+# Older Pythons don't know these, which would send the audio as octet-stream.
+mimetypes.add_type("audio/flac", ".flac")
+mimetypes.add_type("audio/ogg", ".opus")
+
 # ---- Config -----------------------------------------------------------
 
 IMAP_HOST = os.environ["IMAP_HOST"]

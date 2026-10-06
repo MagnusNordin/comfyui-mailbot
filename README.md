@@ -46,12 +46,18 @@ venv/bin/pip install imapclient python-dotenv requests
 
 ### TTS bot
 
-1. Export the TTS workflow (e.g. Chatterbox) in API format.
-2. `cp tts.env.example tts.env && chmod 600 tts.env`, then fill it in.
-   `POSITIVE_NODE_ID` is the node that takes the text and
-   `PROMPT_INPUT_NAME` is the name of its text input; `SAVE_IMAGE_NODE_ID`
-   is the save-audio node. Prefer `SaveAudioMP3`, which plays inline in
-   more mail clients than FLAC.
+1. The included [`workflows/chatterbox_tts_api.json`](workflows/chatterbox_tts_api.json)
+   uses [ComfyUI_Fill-ChatterBox](https://github.com/filliptm/ComfyUI_Fill-ChatterBox)
+   (`FL_ChatterboxMultilingualTTS`, Swedish) and clones the voice from a
+   sample loaded by its Load Audio node: put your own sample in
+   `ComfyUI/input` and change the filename in node `4`. Output is MP3.
+   To use another TTS workflow, export it in API format instead.
+2. `cp tts.env.example tts.env && chmod 600 tts.env`, then fill in the
+   mailbox settings. The node IDs are already set for the included
+   workflow; for your own, `POSITIVE_NODE_ID` is the node that takes the
+   text, `PROMPT_INPUT_NAME` the name of its text input, and
+   `SAVE_IMAGE_NODE_ID` the save-audio node. Prefer MP3 output, which plays
+   inline in more mail clients than FLAC.
 3. Install the service, which runs the same script with `ENV_FILE=tts.env`:
 
    ```bash

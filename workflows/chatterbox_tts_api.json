@@ -1,0 +1,49 @@
+{
+  "2": {
+    "inputs": {
+      "text": "Sverige, i början av 1300-talet. Ett rike i skuggan av maktkamp och brödrafejd. Kung Birger Magnusson satt på tronen, men hans yngre bröder – hertigarna Erik och Valdemar – hungrade efter makten. \nI september år 1306 anlände kungen till Håtuna kungsgård. Han var inbjuden av sina bröder till ett fredligt gästabud. En chans till försoning. Men under ytan av vänskap och skålande bägare, väntade ett av den svenska historiens mörkaste svek. Det som började som en fest för familjen, skulle snart gå till historien som... Håtunaleken.",
+      "language": "Swedish (sv)",
+      "exaggeration": 1.5,
+      "cfg_weight": 0.5,
+      "temperature": 0.8,
+      "repetition_penalty": 2,
+      "min_p": 0.05,
+      "top_p": 1,
+      "seed": 3848099995,
+      "use_cpu": false,
+      "keep_model_loaded": false,
+      "audio_prompt": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "FL_ChatterboxMultilingualTTS",
+    "_meta": {
+      "title": "FL Chatterbox Multilingual TTS"
+    }
+  },
+  "3": {
+    "inputs": {
+      "filename_prefix": "audio/ComfyUI",
+      "format": "mp3",
+      "format.quality": "V0",
+      "audio": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "SaveAudioAdvanced",
+    "_meta": {
+      "title": "Save Audio (Advanced)"
+    }
+  },
+  "4": {
+    "inputs": {
+      "audio": "magnus.m4a"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "Load Audio"
+    }
+  }
+}
