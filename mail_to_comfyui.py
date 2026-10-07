@@ -306,8 +306,10 @@ def process_message(client, uid, raw_message):
     from_addr = email.utils.parseaddr(msg.get("From", ""))[1].lower()
     # Decode RFC 2047 words (=?UTF-8?Q?...?=) so non-ASCII subjects read and match properly.
     subject = str(make_header(decode_header(msg.get("Subject", ""))))
-    message_id = msg.get("Message-ID", "")
-    references = msg.get("References", "") or message_id
+    # Outlook folds these headers ("Message-ID:\r\n <...>"); unfold them, since
+    # header values with line breaks can't be reused in the reply.
+    message_id = " ".join(msg.get("Message-ID", "").split())
+    references = " ".join(msg.get("References", "").split()) or message_id
 
     print(f"[{time.strftime('%H:%M:%S')}] New mail from {from_addr}: {subject!r}")
 
