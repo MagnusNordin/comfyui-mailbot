@@ -262,7 +262,11 @@ def send_reply(to_addr, subject, in_reply_to, references, body_text, image_bytes
     msg = EmailMessage()
     msg["From"] = EMAIL_USER
     msg["To"] = to_addr
-    msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    if not subject.strip():
+        # A bare "Re: " subject counts towards spam; give the reply a real one.
+        msg["Subject"] = f"Your {OUTPUT_KIND}"
+    else:
+        msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     # Spam filters penalise a missing Date and a Message-ID on the machine's
     # bare hostname (e.g. "@magnor"), so set both explicitly.
     msg["Date"] = formatdate(localtime=True)
