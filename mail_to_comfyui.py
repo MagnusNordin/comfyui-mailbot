@@ -102,6 +102,18 @@ NEGATIVE_RE = re.compile(r"^\s*Negative\s*:\s*(.+)$", re.IGNORECASE | re.MULTILI
 # English and Swedish mail clients ("On ... wrote:" / "Den ... skrev:").
 QUOTE_HEADER_RE = re.compile(r"^\s*(On .+ wrote|Den .+ skrev .+):\s*$", re.MULTILINE)
 SIGNATURE_SEP_RE = re.compile(r"^\s*--\s*$", re.MULTILINE)
+# Outlook quotes replies under "Från: ...\nSkickat: ..." (or a line of
+# underscores) and has no "-- " before signatures, so also cut at a sign-off
+# line on its own, e.g. "Med vänlig hälsning" / "Best regards".
+OUTLOOK_QUOTE_RE = re.compile(
+    r"^\s*(_{10,}\s*$|(Från|From):.*\n\s*(Skickat|Sent|Datum|Date):)",
+    re.MULTILINE | re.IGNORECASE,
+)
+SIGN_OFF_RE = re.compile(
+    r"^[ \t]*((med )?vänlig(a)? hälsning(ar)?|mvh|hälsningar|"
+    r"((best|kind|warm) )?regards)[ \t,.!]*$",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 def clean_body(body_text):
@@ -110,7 +122,8 @@ def clean_body(body_text):
     the body as a fallback prompt, so replying to a thread or having an
     email signature doesn't pollute the prompt text.
     """
-    for pattern in (QUOTE_HEADER_RE, SIGNATURE_SEP_RE):
+    body_text = body_text.replace("\r\n", "\n")
+    for pattern in (QUOTE_HEADER_RE, OUTLOOK_QUOTE_RE, SIGNATURE_SEP_RE, SIGN_OFF_RE):
         match = pattern.search(body_text)
         if match:
             body_text = body_text[: match.start()]
