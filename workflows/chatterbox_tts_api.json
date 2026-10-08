@@ -3,7 +3,7 @@
     "inputs": {
       "text": "Sverige, i början av 1300-talet. Ett rike i skuggan av maktkamp och brödrafejd. Kung Birger Magnusson satt på tronen, men hans yngre bröder – hertigarna Erik och Valdemar – hungrade efter makten. \nI september år 1306 anlände kungen till Håtuna kungsgård. Han var inbjuden av sina bröder till ett fredligt gästabud. En chans till försoning. Men under ytan av vänskap och skålande bägare, väntade ett av den svenska historiens mörkaste svek. Det som började som en fest för familjen, skulle snart gå till historien som... Håtunaleken.",
       "language": "Swedish (sv)",
-      "exaggeration": 1.5,
+      "exaggeration": 0.8,
       "cfg_weight": 0.5,
       "temperature": 0.8,
       "repetition_penalty": 2,
