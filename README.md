@@ -99,6 +99,9 @@ Logs: `journalctl -u comfyui-mailbot -f` (or `comfyui-mailbot-tts`).
 | `NEGATIVE_NODE_ID` | unset | Image mode only |
 | `VOICE_NODE_ID` | unset | Load Audio node whose file the subject picks |
 | `VOICE_INPUT_NAME` | `audio` | Input on that node to set |
+| `SEED_NODE_ID` | unset | Node whose seed is randomised per email, so resending gives a new take |
+| `SEED_INPUT_NAME` | `seed` | Seed input on that node |
+| `SEED_MAX` | `4294967295` | Largest seed the node accepts |
 | `DEFAULT_NEGATIVE_PROMPT` | see script | Image mode only |
 | `SAVE_IMAGE_NODE_ID` | - | Save Image / Save Audio node |
 | `RENDER_TIMEOUT_SECONDS` | `300` | |

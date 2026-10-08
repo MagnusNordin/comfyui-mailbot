@@ -19,6 +19,7 @@ their own instance with their own workflow (e.g. ENV_FILE=tts.env).
 import json
 import mimetypes
 import os
+import random
 import re
 import smtplib
 import ssl
@@ -81,6 +82,12 @@ PROMPT_INPUT_NAME = os.environ.get("PROMPT_INPUT_NAME", "text")
 # the subject selects the TTS voice (e.g. "anna" -> anna.wav in ComfyUI/input).
 VOICE_NODE_ID = os.environ.get("VOICE_NODE_ID")
 VOICE_INPUT_NAME = os.environ.get("VOICE_INPUT_NAME", "audio")
+
+# Optional: node whose seed is randomised for every email, so sending the same
+# text again gives a fresh attempt instead of the identical (cached) result.
+SEED_NODE_ID = os.environ.get("SEED_NODE_ID")
+SEED_INPUT_NAME = os.environ.get("SEED_INPUT_NAME", "seed")
+SEED_MAX = int(os.environ.get("SEED_MAX", str(2**32 - 1)))  # Chatterbox's limit
 
 RENDER_TIMEOUT_SECONDS = int(os.environ.get("RENDER_TIMEOUT_SECONDS", "300"))
 IDLE_TIMEOUT_SECONDS = 29 * 60  # RFC 2177 recommends re-issuing IDLE before 30 min
@@ -225,6 +232,8 @@ def submit_render(positive_prompt, negative_prompt, voice=None):
         workflow[NEGATIVE_NODE_ID]["inputs"]["text"] = negative_prompt
     if voice:
         workflow[VOICE_NODE_ID]["inputs"][VOICE_INPUT_NAME] = voice
+    if SEED_NODE_ID:
+        workflow[SEED_NODE_ID]["inputs"][SEED_INPUT_NAME] = random.randint(0, SEED_MAX)
 
     client_id = str(uuid.uuid4())
     resp = requests.post(
