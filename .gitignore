@@ -2,6 +2,9 @@
 .env
 *.env
 env.bild
+# ...and backups of them, e.g. tts.env.bak-2026-10-08
+*.env.bak*
+.env.bak*
 
 __pycache__/
 venv/
