@@ -16,7 +16,9 @@ Set ENV_FILE to use a different file, so several mailboxes can each run
 their own instance with their own workflow (e.g. ENV_FILE=tts.env).
 """
 
+import copy
 import json
+import math
 import mimetypes
 import os
 import random
@@ -89,6 +91,22 @@ SEED_NODE_ID = os.environ.get("SEED_NODE_ID")
 SEED_INPUT_NAME = os.environ.get("SEED_INPUT_NAME", "seed")
 SEED_MAX = int(os.environ.get("SEED_MAX", str(2**32 - 1)))  # Chatterbox's limit
 
+# Optional: a word in the subject switches the TTS language ("Linda engelska"),
+# set on the POSITIVE_NODE_ID node's LANGUAGE_INPUT_NAME input. The values must
+# be options of that input (these are Chatterbox Multilingual's).
+LANGUAGE_INPUT_NAME = os.environ.get("LANGUAGE_INPUT_NAME")
+LANGUAGES = {
+    "svenska": "Swedish (sv)", "svensk": "Swedish (sv)", "swedish": "Swedish (sv)",
+    "engelska": "English (en)", "engelsk": "English (en)", "english": "English (en)",
+}
+
+# Optional: split long texts into pieces of at most this many characters, each
+# rendered by its own copy of the POSITIVE_NODE_ID node and joined with
+# CONCAT_CLASS nodes. Chatterbox stops after ~40 s of audio per node (its
+# max_new_tokens=1000), which is roughly 500 characters of speech.
+CHUNK_MAX_CHARS = int(os.environ.get("CHUNK_MAX_CHARS", "0"))
+CONCAT_CLASS = os.environ.get("CONCAT_CLASS", "AudioConcat")
+
 RENDER_TIMEOUT_SECONDS = int(os.environ.get("RENDER_TIMEOUT_SECONDS", "300"))
 IDLE_TIMEOUT_SECONDS = 29 * 60  # RFC 2177 recommends re-issuing IDLE before 30 min
 
@@ -140,6 +158,15 @@ def clean_body(body_text):
     return "\n".join(lines).strip()
 
 
+def unwrap_lines(text):
+    """
+    Join lines within a paragraph. Mail clients hard-wrap plain text at ~76
+    characters, and TTS would otherwise pause at every one of those breaks.
+    """
+    paragraphs = re.split(r"\n\s*\n", text)
+    return "\n\n".join(" ".join(ln.strip() for ln in p.splitlines() if ln.strip()) for p in paragraphs).strip()
+
+
 def extract_prompts(body_text):
     """Pull 'Prompt: ...' and 'Negative: ...' lines out of the email body.
 
@@ -150,7 +177,7 @@ def extract_prompts(body_text):
     is usually several lines/paragraphs, and there is no negative prompt.
     """
     if OUTPUT_KIND == "audio":
-        return clean_body(body_text) or None, None
+        return unwrap_lines(clean_body(body_text)) or None, None
 
     pos_match = PROMPT_RE.search(body_text)
     neg_match = NEGATIVE_RE.search(body_text)
@@ -224,16 +251,122 @@ def pick_voice(subject):
                   f"({default_name}) was used. Available: {names}")
 
 
-def submit_render(positive_prompt, negative_prompt, voice=None):
+def parse_subject(subject):
+    """
+    Read the voice name and an optional language word from the subject, in
+    any order ("Linda engelska", "english"). Returns (voice file or None,
+    language or None, note for the reply).
+    """
+    words = [w.strip(",.;:!") for w in REPLY_PREFIX_RE.sub("", subject).split()]
+    words = [w for w in words if w]
+    language = None
+    if LANGUAGE_INPUT_NAME:
+        rest = []
+        for word in words:
+            match = LANGUAGES.get(voice_key(word))
+            if match and not language:
+                language = match
+            else:
+                rest.append(word)
+        words = rest
+
+    voice, notes = None, []
+    if VOICE_NODE_ID:
+        voice, voice_note = pick_voice(" ".join(words))
+        notes.append(voice_note)
+    if LANGUAGE_INPUT_NAME:
+        default = load_workflow_template()[POSITIVE_NODE_ID]["inputs"][LANGUAGE_INPUT_NAME]
+        notes.append(f"Language: {language}" if language else
+                     f"Language: {default} (default). Add \"engelska\" to the subject for English.")
+    return voice, language, "\n".join(notes)
+
+
+SENTENCE_END_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def split_text(text, max_chars):
+    """
+    Split text into pieces of at most max_chars, cutting between sentences
+    (words, for an overlong sentence). Pieces are kept about equal in size,
+    since a very short last piece is more likely to come out garbled.
+    """
+    units = []
+    for sentence in SENTENCE_END_RE.split(" ".join(text.split())):
+        while len(sentence) > max_chars:
+            cut = sentence.rfind(" ", 0, max_chars)
+            cut = cut if cut > 0 else max_chars
+            units.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        if sentence:
+            units.append(sentence)
+
+    target = len(text) / max(1, math.ceil(len(text) / max_chars))
+    pieces, current = [], ""
+    for unit in units:
+        if current and (len(current) + 1 + len(unit) > max_chars or len(current) >= target):
+            pieces.append(current)
+            current = unit
+        else:
+            current = f"{current} {unit}".strip()
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def add_text_chunks(workflow, count):
+    """
+    Give each text piece its own copy of the POSITIVE_NODE_ID node, join
+    their audio in order with CONCAT_CLASS nodes, and point whatever used the
+    original node's output (the save node) at the joined audio. Returns the
+    text node ids in reading order.
+    """
+    if count <= 1:
+        return [POSITIVE_NODE_ID]
+    source = [POSITIVE_NODE_ID, 0]
+    consumers = [(nid, name) for nid, node in workflow.items()
+                 for name, value in node["inputs"].items() if value == source]
+    ids = [POSITIVE_NODE_ID] + [f"{POSITIVE_NODE_ID}_part{i}" for i in range(1, count)]
+    for nid in ids[1:]:
+        workflow[nid] = copy.deepcopy(workflow[POSITIVE_NODE_ID])
+
+    joined = source
+    for i, nid in enumerate(ids[1:], 1):
+        workflow[f"join{i}"] = {
+            "class_type": CONCAT_CLASS,
+            "inputs": {"audio1": joined, "audio2": [nid, 0], "direction": "after"},
+        }
+        joined = [f"join{i}", 0]
+    for nid, name in consumers:
+        workflow[nid]["inputs"][name] = joined
+
+    # Chatterbox reloads its model per node unless told to keep it; keep it
+    # loaded between pieces and let the last one unload it as configured.
+    for nid in ids[:-1]:
+        if "keep_model_loaded" in workflow[nid]["inputs"]:
+            workflow[nid]["inputs"]["keep_model_loaded"] = True
+    return ids
+
+
+def submit_render(positive_prompt, negative_prompt, voice=None, language=None):
     workflow = load_workflow_template()
 
-    workflow[POSITIVE_NODE_ID]["inputs"][PROMPT_INPUT_NAME] = positive_prompt
     if NEGATIVE_NODE_ID and negative_prompt is not None:
         workflow[NEGATIVE_NODE_ID]["inputs"]["text"] = negative_prompt
     if voice:
         workflow[VOICE_NODE_ID]["inputs"][VOICE_INPUT_NAME] = voice
-    if SEED_NODE_ID:
+    if SEED_NODE_ID and SEED_NODE_ID != POSITIVE_NODE_ID:
         workflow[SEED_NODE_ID]["inputs"][SEED_INPUT_NAME] = random.randint(0, SEED_MAX)
+
+    pieces = split_text(positive_prompt, CHUNK_MAX_CHARS) if CHUNK_MAX_CHARS else [positive_prompt]
+    if len(pieces) > 1:
+        print(f"  -> long text, rendering {len(pieces)} pieces: {[len(p) for p in pieces]} chars")
+    for node_id, piece in zip(add_text_chunks(workflow, len(pieces)), pieces):
+        inputs = workflow[node_id]["inputs"]
+        inputs[PROMPT_INPUT_NAME] = piece
+        if language:
+            inputs[LANGUAGE_INPUT_NAME] = language
+        if SEED_NODE_ID == POSITIVE_NODE_ID:
+            inputs[SEED_INPUT_NAME] = random.randint(0, SEED_MAX)
 
     client_id = str(uuid.uuid4())
     resp = requests.post(
@@ -354,11 +487,14 @@ def process_message(client, uid, raw_message):
         return
 
     try:
-        voice, voice_note = pick_voice(subject) if VOICE_NODE_ID else (None, "")
+        if VOICE_NODE_ID or LANGUAGE_INPUT_NAME:
+            voice, language, voice_note = parse_subject(subject)
+        else:
+            voice, language, voice_note = None, None, ""
         if voice_note:
-            print(f"  -> {voice_note}")
+            print("  -> " + voice_note.replace("\n", " | "))
         print(f"  -> submitting render: {positive!r}")
-        prompt_id = submit_render(positive, negative, voice)
+        prompt_id = submit_render(positive, negative, voice, language)
         image_info = wait_for_render(prompt_id)
         image_bytes, filename = fetch_image_bytes(image_info)
         print(f"  -> render complete: {filename}")

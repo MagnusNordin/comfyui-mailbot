@@ -28,6 +28,20 @@ voice, and the reply lists the voices available. To add a voice, drop a
 clean sample of the speaker (about 10 seconds or more) into `ComfyUI/input`;
 no restart needed.
 
+With `LANGUAGE_INPUT_NAME` set, a language word anywhere in the subject
+switches the language: `Linda engelska`, `english Mira`, or just `engelska`
+for the default voice (`svenska`/`swedish` and `engelska`/`english` are
+understood). Without one, the workflow's language (Swedish) is used.
+
+### Long texts (TTS)
+
+Chatterbox stops after about 40 seconds of audio per node. With
+`CHUNK_MAX_CHARS` set, longer texts are split between sentences into evenly
+sized pieces of at most that many characters, each rendered by its own copy
+of the TTS node, joined in order with ComfyUI's `AudioConcat` node and saved
+as one file. Lines that mail clients hard-wrap inside a paragraph are joined
+first, so the voice doesn't pause at every line break.
+
 ## Setup
 
 Requires Python 3 and a running ComfyUI.
@@ -102,6 +116,12 @@ Logs: `journalctl -u comfyui-mailbot -f` (or `comfyui-mailbot-tts`).
 | `SEED_NODE_ID` | unset | Node whose seed is randomised per email, so resending gives a new take |
 | `SEED_INPUT_NAME` | `seed` | Seed input on that node |
 | `SEED_MAX` | `4294967295` | Largest seed the node accepts |
+| `LANGUAGE_INPUT_NAME` | unset | Language input on the TTS node; enables a language word in the subject |
+| `CHUNK_MAX_CHARS` | unset | Split longer texts into pieces of at most this many characters |
+| `CONCAT_CLASS` | `AudioConcat` | Node used to join the pieces |
+
+Run the tests with `python -m unittest test_mail_to_comfyui -v`
+(ComfyUI and mail are mocked).
 | `DEFAULT_NEGATIVE_PROMPT` | see script | Image mode only |
 | `SAVE_IMAGE_NODE_ID` | - | Save Image / Save Audio node |
 | `RENDER_TIMEOUT_SECONDS` | `300` | |
